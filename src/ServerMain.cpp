@@ -187,6 +187,11 @@ int main(int argc, char** argv) {
           &RuntimeParameters::enableMaterializedViewQueryRewrite_>(),
       "If set to true, loaded materialized views will be considered as "
       "alternative query plans for certain supported query patterns.");
+  add("query-telemetry",
+      optionFactory.getProgramOption<&RuntimeParameters::queryTelemetry_>(),
+      "Emit a structured JSON telemetry record to stdout for every completed "
+      "SPARQL query or update. Each record includes query is, text, duration, "
+      "planning time and result size");
   add("service-allowed-iri-prefixes",
       optionFactory
           .getProgramOption<&RuntimeParameters::serviceAllowedIriPrefixes_>()

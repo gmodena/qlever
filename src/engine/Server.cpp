@@ -36,6 +36,7 @@
 #include "util/FilesystemHelpers.h"
 #include "util/MemorySize/MemorySize.h"
 #include "util/ParseableDuration.h"
+#include "util/StringUtils.h"
 #include "util/TimeTracer.h"
 #include "util/TypeTraits.h"
 #include "util/http/HttpServer.h"
@@ -44,6 +45,44 @@
 
 using namespace std::string_literals;
 using namespace ad_utility::url_parser::sparqlOperation;
+
+namespace {
+// Emit a single-line JSON telemetry record to the log stream. Fields follow
+// the Elastic Common Schema (ECS) convention.
+void logQueryTelemetry(std::string_view queryId,
+                       std::string_view operationString,
+                       const ad_utility::Timer& requestTimer,
+                       const std::optional<Server::PlannedQuery>& plannedQuery,
+                       std::string_view operationType = "",
+                       std::string_view outcome = "success") {
+  nlohmann::json j;
+  j["@timestamp"] = ad_utility::Log::getTimeStamp();
+  j["ecs.version"] = ad_utility::ECS_VERSION;
+  if (!operationType.empty()) {
+    j["event.action"] = operationType;
+  }
+  j["event.outcome"] = outcome;
+  j["event.duration"] =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(requestTimer.value())
+          .count();
+  if (!queryId.empty()) {
+    j["qlever.query_id"] = queryId;
+  }
+  j["qlever.query"] = ad_utility::truncateOperationString(operationString);
+  j["qlever.duration_ms"] = requestTimer.msecs().count();
+  if (plannedQuery.has_value()) {
+    const auto& ri =
+        plannedQuery->queryExecutionTree().getRootOperation()->runtimeInfo();
+    j["qlever.planning_ms"] = plannedQuery->queryExecutionTree()
+                                  .getRootOperation()
+                                  ->getRuntimeInfoWholeQuery()
+                                  .timeQueryPlanning.count();
+    j["qlever.result_rows_count"] = ri.numRows_;
+    j["qlever.result_cols_count"] = ri.numCols_;
+  }
+  ad_utility::LogstreamChoice::get().getStream() << j.dump() << "\n";
+}
+}  // namespace
 
 template <typename T>
 using Awaitable = Server::Awaitable<T>;
@@ -661,6 +700,9 @@ CPP_template_def(typename RequestT, typename ResponseT)(
     ad_utility::websocket::MessageSender messageSender =
         createMessageSender(queryHub_, request, operationString);
 
+    std::string queryId =
+        nlohmann::json(messageSender.getQueryId()).get<std::string>();
+
     auto [qecPtr, cancellationHandle, cancelTimeoutOnDestruction] =
         prepareOperation(operationName, operationString,
                          std::move(messageSender), parameters,
@@ -670,18 +712,25 @@ CPP_template_def(typename RequestT, typename ResponseT)(
       throw std::runtime_error(absl::StrCat(
           msg, ad_utility::truncateOperationString(operationString)));
     }
+    std::string_view operationType;
     if (ql::ranges::all_of(operations, &ParsedQuery::hasUpdateClause)) {
-      co_return co_await processUpdate(
-          std::move(operations), requestTimer, tracer, cancellationHandle, qec,
-          std::move(request), send, timeLimit.value(), plannedQuery);
+      co_await processUpdate(std::move(operations), requestTimer, tracer,
+                             cancellationHandle, qec, std::move(request), send,
+                             timeLimit.value(), plannedQuery);
+      operationType = "sparql_update";
     } else {
       AD_CORRECTNESS_CHECK(operations.size() == 1);
       ParsedQuery query = std::move(operations[0]);
       AD_CORRECTNESS_CHECK(query.hasSelectClause() || query.hasAskClause() ||
                            query.hasConstructClause());
-      co_return co_await processQuery(
-          parameters, std::move(query), requestTimer, cancellationHandle, qec,
-          std::move(request), send, timeLimit.value(), plannedQuery);
+      co_await processQuery(parameters, std::move(query), requestTimer,
+                            cancellationHandle, qec, std::move(request), send,
+                            timeLimit.value(), plannedQuery);
+      operationType = "sparql_query";
+    }
+    if (getRuntimeParameter<&RuntimeParameters::queryTelemetry_>()) {
+      logQueryTelemetry(queryId, operationString, requestTimer, plannedQuery,
+                        operationType);
     }
   };
   auto visitQuery = [this, &visitOperation](Query query) -> Awaitable<void> {
@@ -1095,9 +1144,11 @@ CPP_template_def(typename RequestT, typename ResponseT)(
                                   requestTimer, cancellationHandle);
   // Print the runtime info. This needs to be done after the query
   // was computed.
-  AD_LOG_INFO << "Done processing query and sending result"
-              << ", total time was " << requestTimer.msecs().count() << " ms"
-              << std::endl;
+  if (!getRuntimeParameter<&RuntimeParameters::queryTelemetry_>()) {
+    AD_LOG_INFO << "Done processing query and sending result"
+                << ", total time was " << requestTimer.msecs().count() << " ms"
+                << std::endl;
+  }
 
   // Log that we are done with the query and how long it took.
   //
@@ -1364,6 +1415,10 @@ CPP_template_def(typename VisitorT, typename RequestT, typename ResponseT)(
   }
   if (exceptionErrorMsg) {
     AD_LOG_ERROR << exceptionErrorMsg.value() << std::endl;
+    if (getRuntimeParameter<&RuntimeParameters::queryTelemetry_>()) {
+      logQueryTelemetry("", operationString, requestTimer, plannedQuery,
+                        "failure");
+    }
     if (metadata) {
       // The `coloredError()` message might fail because of the
       // different Unicode handling of QLever and ANTLR. Make sure to
