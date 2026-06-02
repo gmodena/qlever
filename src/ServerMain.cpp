@@ -197,6 +197,10 @@ int main(int argc, char** argv) {
       "prefix are rejected. To disable all federated queries, set this option "
       "to an invalid IRI prefix like `-`. Magic services (for example spatial "
       "search or materialized views) are never affected.");
+  bool ecsLogging = false;
+  add("log-format-ecs", po::bool_switch(&ecsLogging)->default_value(false),
+      "Output all log lines in ECS JSON format (default: plain text).");
+
   po::variables_map optionsMap;
 
   try {
@@ -214,6 +218,10 @@ int main(int argc, char** argv) {
     std::cerr << "Error in command-line argument: " << e.what() << '\n';
     std::cerr << options << '\n';
     return EXIT_FAILURE;
+  }
+
+  if (ecsLogging) {
+    ad_utility::setEcsLogging(true);
   }
 
   AD_LOG_INFO << EMPH_ON << "QLever server " << qlever::version::ProjectVersion
