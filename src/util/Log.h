@@ -14,11 +14,14 @@
 #include <iostream>
 #include <locale>
 #include <sstream>
+#include <streambuf>
 #include <string>
 
 #include "backports/keywords.h"
 #include "util/ConstexprMap.h"
 #include "util/TypeTraits.h"
+// TODO(gmodena, 2026-06): including util/json.h leads to a circular dependency
+#include <nlohmann/json.hpp>
 
 #ifndef LOGLEVEL
 #define LOGLEVEL INFO
@@ -71,6 +74,11 @@ struct LogstreamChoice {
 
   // default to cout since it was the default before
   std::ostream* _stream = &std::cout;
+  bool ecsMode_ = false;
+
+ public:
+  void setEcsMode(bool enabled) { ecsMode_ = enabled; }
+  bool isEcsMode() const { return ecsMode_; }
 };
 
 // After this call, every use of `AD_LOG_...` will use the specified stream.
@@ -78,6 +86,79 @@ struct LogstreamChoice {
 inline void setGlobalLoggingStream(std::ostream* stream) {
   LogstreamChoice::get().setStream(stream);
 }
+
+// Enable or disable ECS JSON formatting for all `AD_LOG_...` output.
+inline void setEcsLogging(bool enabled) {
+  LogstreamChoice::get().setEcsMode(enabled);
+}
+
+// ECS specification version used in all emitted JSON records.
+inline constexpr std::string_view ECS_VERSION = "9.4.0";
+
+// A std::streambuf that accumulates a single log entry and on sync() emits it
+// as a one-line ECS JSON record to the LogstreamChoice stream.
+class EcsLogBuffer : public std::streambuf {
+ public:
+  void startEntry(LogLevel level, std::string timestamp) {
+    if (!buffer_.empty()) {
+      emitEntry();
+      buffer_.clear();
+    }
+    level_ = level;
+    timestamp_ = std::move(timestamp);
+  }
+
+ protected:
+  int overflow(int c) override {
+    if (c != EOF) buffer_ += static_cast<char>(c);
+    return c;
+  }
+
+  int sync() override {
+    if (!buffer_.empty()) {
+      emitEntry();
+      buffer_.clear();
+    }
+    return 0;
+  }
+
+ private:
+  static constexpr std::string_view levelToString(LogLevel level) {
+    switch (level) {
+      case TRACE:
+        return "TRACE";
+      case TIMING:
+        return "TIMING";
+      case DEBUG:
+        return "DEBUG";
+      case INFO:
+        return "INFO";
+      case WARN:
+        return "WARN";
+      case ERROR:
+        return "ERROR";
+      case FATAL:
+        return "FATAL";
+    }
+    return "UNKNOWN";
+  }
+
+  void emitEntry() {
+    auto end = buffer_.find_last_not_of("\n\r");
+    if (end == std::string::npos) return;
+    nlohmann::json j{
+        {"@timestamp", timestamp_},
+        {"log.level", std::string(levelToString(level_))},
+        {"message", buffer_.substr(0, end + 1)},
+        {"ecs.version", std::string(ECS_VERSION)},
+    };
+    LogstreamChoice::get().getStream() << j.dump() << "\n";
+  }
+
+  std::string buffer_;
+  LogLevel level_ = INFO;
+  std::string timestamp_;
+};
 
 // Helper class to get thousandth separators in a locale
 class CommaNumPunct : public std::numpunct<char> {
@@ -94,6 +175,12 @@ class Log {
  public:
   template <LogLevel LEVEL>
   static std::ostream& getLog() {
+    if (LogstreamChoice::get().isEcsMode()) {
+      thread_local EcsLogBuffer ecsBuf;
+      thread_local std::ostream ecsStream(&ecsBuf);
+      ecsBuf.startEntry(LEVEL, getTimeStamp());
+      return ecsStream;
+    }
     // use the singleton logging stream as target.
     return LogstreamChoice::get().getStream()
            << getTimeStamp() << " - " << getLevel<LEVEL>() << ": ";
